@@ -1,0 +1,143 @@
+#!/bin/sh
+
+# semaphoric:
+# A utility to limit concurrency by running a command only if fewer than some
+# number of other commands (associated with an arbitrary id) are running.
+#
+# The id defines the scope of the semaphore.
+# If id contains a / then it's treated as the directory to store the semaphores.
+# Otherwise they're stored in /tmp/semaphoric-$USER/.
+#
+# Features:
+# - very lightweight
+# - most callers block cheaply on file lock until ready
+# - only one process (the next-to-be-run) polls for a semaphore
+# - first-in-first-out queuing, no starvation or similar risks
+# - doesn't use SysV semaphores so is robust and stable
+# - returns the exit status of the command
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+show_usage() {
+    cat <<EOS >&2
+$0 [options] id 'command args...'
+options:
+   --max-procs=N   - max concurrent processes for the specified id (default 1)
+   --sem-dir=D     - directory in which to create lock files (default /tmp/semaphoric-$USER)
+   --poll-secs=N   - delay between semaphore checks for the next-to-run process (default 5)
+   --verbose       - log trace information to stderr
+EOS
+}
+
+
+max_procs=1
+verbose=0
+poll_seconds=5
+sem_dir="${TMPDIR:-/tmp}/semaphoric-$USER"
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        -h|-\?|--help)
+            show_usage
+            exit 1
+            ;;
+        --max-procs=?*)
+            max_procs=${1#*=} # Delete everything up to "=" and assign the remainder.
+            ;;
+        --sem-dir=?*)
+            sem_dir=${1#*=}
+            ;;
+        --poll-secs=?*)
+            poll_seconds=${1#*=}
+            ;;
+        -v|--verbose)
+            let verbose=$((verbose + 1)) # Each -v argument adds 1 to verbosity.
+            ;;
+        --)              # End of all options.
+            shift
+            break
+            ;;
+        -?*)
+            printf '\nERROR: Unknown option: %s\n\n' "$1" >&2
+            show_usage;
+            exit 1
+            ;;
+        *)               # Default case: If no more options then break out of the loop.
+            break
+    esac
+    shift
+done
+
+if (( $# != 2 )) # id and command+args
+then
+    show_usage
+    exit 1
+fi
+
+id=$1; shift; # so command is all that's left in $*
+
+(($verbose >= 1)) && echo "$0 for: $*" >&2
+
+if [[ $id =~ '/' ]]
+then
+    sem_id_dir="$id"
+else
+    sem_id_dir="$sem_dir/$id" # directory for the semaphore files for this id
+fi
+
+mkdir -p "$sem_id_dir"    # make sure it exists
+
+# Open a file handle that we'll use to serialize access to the semaphores.
+# (Without this there's a starvation risk and it's also less efficient.)
+# We use a file handle not a file because we want the lock to persist for
+# the rest of this script execution but also be unlockable by the subprocess
+# that gets a lock on a semaphore.
+exec 200>>$sem_id_dir/serialize.lock
+flock -x 200 # typically processes block here 'at the door' for an exclusive lock
+
+# flock exit status doesn't distinguish failure to lock and failure of the command
+# so we use the existence of a file created by the command as a way to tell that
+# the command was run. If the file exists and flock returns an error then we know
+# that the error came from the command and not flock itself.
+ran_marker="$sem_id_dir/$$.ran"
+rm -f $ran_marker              # ensure it doesn't exist to start with
+trap 'rm -f $ran_marker' EXIT  # ensure the file gets removed on exit
+
+(($verbose >= 1)) && echo "$id: checking $max_procs semaphores for: $*" >&2
+
+semaphore_list="$(seq $max_procs)" # pre-create list of semaphores (optimization)
+
+while true
+do
+    for i in $semaphore_list
+    do
+        # try to lock one of the semaphores, without blocking
+        # if we succeed then:
+        #  - release the serialization lock
+        #  - touch (create) a file to indicate that the command was run
+        #  - run the command
+        if flock --nonblock $sem_id_dir/$i.sem -c "flock -u 200; touch '$ran_marker'; $*"
+        then
+            exit 0 # locked ok and ran ok
+        fi
+
+        # flock returned an error status, so...
+        err=$?  # record the status
+        # but why? It could be due to either:
+        # a) failing to get a lock, e.g. all semaphores are busy, or
+        # b) got a lock and ran the command but the command failed
+        # if the ran_marker file exists then the error was from the command
+        # so exit with the saved error status
+        [[ -e $ran_marker ]] && exit $err
+
+        (($verbose >= 2)) && echo "$id: semaphore $i of $max_procs busy" >&2
+    done
+
+    # only one process per $id will loop here
+    (($verbose >= 1)) && echo "$id: all $max_procs semaphores are busy, will retry in $poll_seconds seconds for: $*" >&2
+    sleep $poll_seconds
+
+done
+# NOTREACHED
